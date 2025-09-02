@@ -1439,6 +1439,9 @@ class ProxyConfig:
         if os.path.exists(f"{file_path}"):
             with open(f"{file_path}", "r") as config_file:
                 config = yaml.safe_load(config_file)
+            # PREDIBASE PATCH - Deletes the file from disk
+            print("Removing file from disk: ", file_path)
+            os.remove(f"{file_path}")
         elif file_path is not None:
             raise Exception(f"Config file not found: {file_path}")
         else:
