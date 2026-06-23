@@ -23,6 +23,36 @@ from litellm.types.utils import TokenCountResponse
 router = APIRouter()
 
 
+def _get_blocked_response_usage(
+    model: str,
+    messages: Optional[list],
+    block_message: str,
+) -> dict:
+    """
+    Compute token usage for a synthetic guardrail-blocked response.
+
+    The original request still consumed input tokens and the synthetic block
+    message has real content, so both counts are computed rather than reported
+    as zero. Token counting is best-effort: any failure falls back to 0 so a
+    blocked response is always returned to the caller.
+    """
+    import litellm
+
+    input_tokens = 0
+    output_tokens = 0
+    try:
+        if messages:
+            input_tokens = litellm.token_counter(model=model, messages=messages)
+        if block_message:
+            output_tokens = litellm.token_counter(model=model, text=block_message)
+    except Exception as token_count_error:
+        verbose_proxy_logger.debug(
+            "Failed to count tokens for blocked response: %s", token_count_error
+        )
+
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens}
+
+
 @router.post(
     "/v1/messages",
     tags=["[beta] Anthropic `/v1/messages`"],
@@ -87,6 +117,16 @@ async def anthropic_response(  # noqa: PLR0915
 
         from litellm.types.utils import AnthropicMessagesResponse
 
+        # The original request was processed upstream and the block message is
+        # synthesized here, so both token counts are reachable: input_tokens
+        # from the original request messages (carried on the exception) and
+        # output_tokens from the block message text.
+        _usage = _get_blocked_response_usage(
+            model=e.model,
+            messages=_data.get("messages"),
+            block_message=e.message,
+        )
+
         _anthropic_response = AnthropicMessagesResponse(
             id=f"msg_{str(uuid.uuid4())}",
             type="message",
@@ -94,7 +134,7 @@ async def anthropic_response(  # noqa: PLR0915
             content=[{"type": "text", "text": e.message}],
             model=e.model,
             stop_reason="end_turn",
-            usage={"input_tokens": 0, "output_tokens": 0},
+            usage=_usage,
         )
 
         if data.get("stream", None) is not None and data["stream"] is True:

@@ -69,6 +69,60 @@ class TestAnthropicEndpoints(unittest.TestCase):
         )  # Called twice, once for each dict object
 
 
+class TestBlockedResponseUsage:
+    """Token usage on synthetic guardrail-blocked responses."""
+
+    def test_blocked_response_reports_nonzero_token_counts(self):
+        from litellm.proxy.anthropic_endpoints.endpoints import (
+            _get_blocked_response_usage,
+        )
+
+        usage = _get_blocked_response_usage(
+            model="claude-3-5-sonnet-20240620",
+            messages=[{"role": "user", "content": "Tell me something harmful"}],
+            block_message="This request was blocked by a content guardrail.",
+        )
+
+        assert usage["input_tokens"] > 0
+        assert usage["output_tokens"] > 0
+
+    def test_blocked_response_output_tokens_match_block_message(self):
+        import litellm
+        from litellm.proxy.anthropic_endpoints.endpoints import (
+            _get_blocked_response_usage,
+        )
+
+        model = "claude-3-5-sonnet-20240620"
+        block_message = "Blocked: this content violates policy."
+
+        usage = _get_blocked_response_usage(
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            block_message=block_message,
+        )
+
+        expected_output = litellm.token_counter(model=model, text=block_message)
+        assert usage["output_tokens"] == expected_output
+
+    def test_blocked_response_usage_falls_back_to_zero_on_error(self):
+        from unittest.mock import patch
+
+        from litellm.proxy.anthropic_endpoints.endpoints import (
+            _get_blocked_response_usage,
+        )
+
+        with patch(
+            "litellm.token_counter", side_effect=RuntimeError("boom")
+        ):
+            usage = _get_blocked_response_usage(
+                model="claude-3-5-sonnet-20240620",
+                messages=[{"role": "user", "content": "hi"}],
+                block_message="blocked",
+            )
+
+        assert usage == {"input_tokens": 0, "output_tokens": 0}
+
+
 class TestEventLoggingBatchEndpoint:
     """Test the stubbed event logging batch endpoint"""
 
