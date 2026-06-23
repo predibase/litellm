@@ -15,7 +15,10 @@ from fastapi import HTTPException
 from litellm._logging import verbose_proxy_logger
 from litellm.caching.caching import DualCache
 from litellm.cost_calculator import _infer_call_type
-from litellm.integrations.custom_guardrail import CustomGuardrail
+from litellm.integrations.custom_guardrail import (
+    CustomGuardrail,
+    ModifyResponseException,
+)
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_for_route
 from litellm.llms import load_guardrail_translation_mappings
@@ -50,6 +53,38 @@ def _get_a2a_request_id(
 
 
 endpoint_guardrail_translation_mappings = None
+
+# Call types whose post-call streaming uses the Anthropic /v1/messages SSE format.
+ANTHROPIC_CALL_TYPES = (CallTypes.anthropic_messages,)
+
+
+def _anthropic_block_sse_chunks(exc: ModifyResponseException) -> List[bytes]:
+    """
+    Build a well-formed Anthropic SSE sequence delivering the guardrail block
+    message as assistant text and terminating the stream cleanly.
+
+    Reuses FakeAnthropicMessagesStreamIterator (the same converter used by the
+    /v1/messages endpoint's pre-stream block handler) so the event format stays
+    consistent: message_start -> content_block_start/delta/stop ->
+    message_delta (with stop_reason) -> message_stop.
+    """
+    import uuid
+
+    from litellm.llms.anthropic.experimental_pass_through.messages.fake_stream_iterator import (
+        FakeAnthropicMessagesStreamIterator,
+    )
+    from litellm.types.utils import AnthropicMessagesResponse
+
+    block_response = AnthropicMessagesResponse(
+        id=f"msg_{uuid.uuid4()}",
+        type="message",
+        role="assistant",
+        content=[{"type": "text", "text": exc.message}],
+        model=exc.model,
+        stop_reason="end_turn",
+        usage={"input_tokens": 0, "output_tokens": 0},
+    )
+    return list(FakeAnthropicMessagesStreamIterator(response=block_response))
 
 
 def _ensure_litellm_metadata(data: dict, user_api_key_dict: UserAPIKeyAuth) -> None:
@@ -284,6 +319,28 @@ class UnifiedLLMGuardrails(CustomLogger):
 
         return response
 
+    async def _handle_streaming_block(
+        self,
+        exc: ModifyResponseException,
+        call_type: Optional[str],
+    ) -> AsyncGenerator[Any, None]:
+        """
+        Emit a well-formed terminating stream for a guardrail block raised
+        mid/end-stream (after chunks have already been yielded to the client).
+
+        Anthropic: synthesize the full SSE termination sequence delivering the
+        block message as assistant text (see _anthropic_block_sse_chunks).
+
+        For any other format we re-raise: the bug being fixed is specific to the
+        Anthropic SSE parser, and there is no safe generic in-stream terminator
+        once partial chunks have been sent.
+        """
+        if call_type is not None and CallTypes(call_type) in ANTHROPIC_CALL_TYPES:
+            for chunk in _anthropic_block_sse_chunks(exc):
+                yield chunk
+            return
+        raise exc
+
     async def async_post_call_streaming_iterator_hook(  # noqa: PLR0915
         self,
         user_api_key_dict: UserAPIKeyAuth,
@@ -428,6 +485,16 @@ class UnifiedLLMGuardrails(CustomLogger):
                         user_api_key_dict=user_api_key_dict,
                         request_data=request_data,
                     )
+                except ModifyResponseException as e:
+                    # Guardrail blocked the response mid-stream. Emit a clean
+                    # terminating SSE sequence delivering the block message
+                    # instead of letting the exception propagate into a bare
+                    # `data: {"error": ...}` blob (which truncates the stream).
+                    async for block_chunk in self._handle_streaming_block(
+                        e, call_type
+                    ):
+                        yield block_chunk
+                    return
                 except HTTPException as e:
                     # Response already started (we already yielded chunks); cannot send 400.
                     # For A2A (NDJSON), yield an in-stream JSON-RPC error so the client sees it.
@@ -489,6 +556,13 @@ class UnifiedLLMGuardrails(CustomLogger):
                     user_api_key_dict=user_api_key_dict,
                     request_data=request_data,
                 )
+            except ModifyResponseException as e:
+                # Block detected during end-of-stream processing. Emit a clean
+                # terminating SSE sequence with the block message rather than
+                # propagating into a bare error blob that truncates the stream.
+                async for block_chunk in self._handle_streaming_block(e, call_type):
+                    yield block_chunk
+                return
             except HTTPException as e:
                 if call_type is not None and CallTypes(call_type) in A2A_CALL_TYPES:
                     request_id = _get_a2a_request_id(responses_so_far, request_data)
