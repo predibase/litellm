@@ -8,7 +8,7 @@ Unified Guardrail, leveraging LiteLLM's /applyGuardrail endpoint
 
 import copy
 import json
-from typing import Any, AsyncGenerator, List, Optional, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import HTTPException
 
@@ -82,9 +82,35 @@ def _anthropic_block_sse_chunks(exc: ModifyResponseException) -> List[bytes]:
         content=[{"type": "text", "text": exc.message}],
         model=exc.model,
         stop_reason="end_turn",
-        usage={"input_tokens": 0, "output_tokens": 0},
+        usage=_block_response_usage(exc),
     )
     return list(FakeAnthropicMessagesStreamIterator(response=block_response))
+
+
+def _block_response_usage(exc: ModifyResponseException) -> Dict[str, int]:
+    """
+    Compute token usage for the synthetic block response: input_tokens from the
+    original request messages (carried on the exception) and output_tokens from
+    the block message. Best-effort -- any failure falls back to 0 so a block
+    response is always emitted.
+    """
+    import litellm
+
+    input_tokens = 0
+    output_tokens = 0
+    try:
+        messages = (exc.request_data or {}).get("messages")
+        if messages:
+            input_tokens = litellm.token_counter(model=exc.model, messages=messages)
+        if exc.message:
+            output_tokens = litellm.token_counter(model=exc.model, text=exc.message)
+    except Exception as token_count_error:
+        verbose_proxy_logger.debug(
+            "Failed to count tokens for blocked stream response: %s",
+            token_count_error,
+        )
+
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens}
 
 
 def _ensure_litellm_metadata(data: dict, user_api_key_dict: UserAPIKeyAuth) -> None:
