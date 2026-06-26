@@ -395,6 +395,11 @@ class UnifiedLLMGuardrails(CustomLogger):
         # Get streaming configuration from guardrail or optional_params
         sampling_rate = 5
         end_of_stream_only = False  # If True, only apply guardrail at end of stream
+        # If True, withhold every chunk until end-of-stream moderation passes,
+        # then release the original chunks (clean) or only the block message
+        # (blocked). Implies end_of_stream_only. Lets a guardrail moderate the
+        # whole response *before* any content reaches the client.
+        buffer_until_moderated = False
 
         if guardrail_to_apply is not None:
             # Check direct attributes on guardrail first
@@ -403,6 +408,11 @@ class UnifiedLLMGuardrails(CustomLogger):
             )
             end_of_stream_only = getattr(
                 guardrail_to_apply, "streaming_end_of_stream_only", end_of_stream_only
+            )
+            buffer_until_moderated = getattr(
+                guardrail_to_apply,
+                "streaming_buffer_until_moderated",
+                buffer_until_moderated,
             )
 
             # Also check guardrail_config dict if present
@@ -414,14 +424,25 @@ class UnifiedLLMGuardrails(CustomLogger):
                 end_of_stream_only = guardrail_config.get(
                     "streaming_end_of_stream_only", end_of_stream_only
                 )
+                buffer_until_moderated = guardrail_config.get(
+                    "streaming_buffer_until_moderated", buffer_until_moderated
+                )
 
         # Also check optional_params as fallback
         sampling_rate = self.optional_params.get(
             "streaming_sampling_rate", sampling_rate
         )
+        buffer_until_moderated = self.optional_params.get(
+            "streaming_buffer_until_moderated", buffer_until_moderated
+        )
         end_of_stream_only = self.optional_params.get(
             "streaming_end_of_stream_only", end_of_stream_only
         )
+
+        # Buffering can only moderate the assembled response, so it always
+        # defers to end-of-stream.
+        if buffer_until_moderated:
+            end_of_stream_only = True
 
         if guardrail_to_apply is None:
             async for item in response:
@@ -477,9 +498,13 @@ class UnifiedLLMGuardrails(CustomLogger):
                     yield remaining_item
                 return
 
-            # If end_of_stream_only mode, yield chunks without processing
+            # If end_of_stream_only mode, yield chunks without processing.
+            # When buffering, withhold them instead -- they are released (or
+            # replaced by the block message) only after end-of-stream
+            # moderation runs below.
             if end_of_stream_only:
-                yield item
+                if not buffer_until_moderated:
+                    yield item
                 continue
 
             # Process chunk based on sampling rate
@@ -574,6 +599,13 @@ class UnifiedLLMGuardrails(CustomLogger):
                 CallTypes(call_type)
             ]()
 
+            # When buffering, snapshot the original chunks before moderation:
+            # process_output_streaming_response may rewrite responses_so_far
+            # in place (combined text into the first chunk, the rest cleared).
+            buffered_items = (
+                copy.deepcopy(responses_so_far) if buffer_until_moderated else None
+            )
+
             try:
                 await endpoint_translation.process_output_streaming_response(
                     responses_so_far=responses_so_far,
@@ -582,10 +614,15 @@ class UnifiedLLMGuardrails(CustomLogger):
                     user_api_key_dict=user_api_key_dict,
                     request_data=request_data,
                 )
+                # Moderation passed: release the withheld original chunks.
+                if buffered_items is not None:
+                    for buffered_item in buffered_items:
+                        yield buffered_item
             except ModifyResponseException as e:
                 # Block detected during end-of-stream processing. Emit a clean
                 # terminating SSE sequence with the block message rather than
                 # propagating into a bare error blob that truncates the stream.
+                # The withheld original chunks are never released.
                 async for block_chunk in self._handle_streaming_block(e, call_type):
                     yield block_chunk
                 return
